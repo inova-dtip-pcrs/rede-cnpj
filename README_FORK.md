@@ -58,7 +58,7 @@ O prefixo de rota segue o `subdomain` configurado em `rede.ini`
 |---|---|---|
 | `GET /rede/api/ext/busca/nome` | Busca ids por nome/razão social (full text) | `q` (obrigatório), `limite` (padrão 10, máx. 100) |
 | `GET /rede/api/ext/busca/cnpj_raiz/<cnpj_basico>` | Busca ids de filiais a partir da raiz do CNPJ (8 dígitos) | `limite` (padrão 10, máx. 200) |
-| `GET /rede/api/ext/busca/cnae/<codigo>` | Busca ids de empresas pelo CNAE fiscal principal (7 dígitos) | `limite` (padrão 10, máx. 200) |
+| `GET /rede/api/ext/busca/cnae/<codigo>` | Busca ids de empresas pelo CNAE fiscal principal (7 dígitos), paginado — ver [Paginação da busca por CNAE](#paginação-da-busca-por-cnae) | `limite` (padrão 10, máx. 5000), `uf` (sigla do Estado ou `EX`, opcional), `proxima_pagina` (valor recebido na resposta anterior, opcional) |
 | `GET /rede/api/ext/busca/cpf/<cpf_parcial>` | Busca ids de sócios PF pelo miolo do CPF (mín. 9 dígitos) | `limite` (padrão 10, máx. 100) |
 | `GET /rede/api/ext/dados` | Retorna dados completos de uma lista de ids (CNPJ/CPF) | `ids` (obrigatório, separados por vírgula, ex. `PJ_12345678000199,PJ_...`), `socios` (`1` para incluir sócios) |
 
@@ -85,19 +85,61 @@ curl "http://localhost/rede/api/ext/busca/cpf/123456789?limite=30"
 O `limite` enviado pelo cliente é só um teto sugerido: o valor efetivamente
 usado na consulta é sempre `min(limite_pedido, teto_do_servidor)`, e o teto é
 fixo no código (não é configurável via `rede.ini`). Se `limite` vier omitido
-ou como `0`, cai no padrão de 10.
+ou como `0` (ou negativo, em `/busca/cnae`), cai no padrão de 10.
 
 | Rota | Teto do servidor | Onde está no código |
 |---|---|---|
 | `/busca/nome` | 100 | `rede_sqlite_cnpj.buscaPorNome` |
 | `/busca/cnpj_raiz/<cnpj_basico>` | 200 | `rede_sqlite_cnpj.busca_cnpj` |
-| `/busca/cnae/<codigo>` | 200 | `rede_sqlite_cnpj.busca_cnae` |
+| `/busca/cnae/<codigo>` | 5000 por página | `rede_sqlite_cnpj.busca_cnae` |
 | `/busca/cpf/<cpf_parcial>` | 100 | `rede_sqlite_cnpj.busca_cpf` |
 | `/dados` | **sem limite** — processa todos os `ids` enviados | `rede_sqlite_cnpj.jsonDados` |
 
 Como `/dados` não limita a quantidade de `ids` por requisição, o único freio
 para um payload muito grande nessa rota hoje é o rate limit de requisições
 (`limiter_dados`, abaixo) — não há cap de tamanho de lista.
+
+### Paginação da busca por CNAE
+
+`/busca/cnae/<codigo>` é pensada para carga em lote (trazer **todos** os
+CNPJs de um CNAE, que podem ser centenas de milhares), então é paginada em
+vez de ter só um teto. A resposta traz, além de `ids` (em ordem crescente de
+CNPJ, sem repetição), o campo `proxima_pagina`:
+
+```json
+{"ids": ["PJ_00401774000164", "...", "PJ_01040736000156"], "proxima_pagina": "01040736000156"}
+```
+
+Para pegar a página seguinte, reenvie esse valor no parâmetro de **mesmo
+nome**, `proxima_pagina`. Repita até `proxima_pagina` vir `null` — isso já
+acontece na 1ª resposta quando todos os CNPJs cabem numa página (ex.: CNAE
+com menos de 5000 empresas e `limite=5000`), e nunca é preciso uma chamada
+extra só para descobrir que acabou. Lembre de enviar `limite`: sem ele, cada
+página tem só 10 CNPJs.
+
+```bash
+curl "http://localhost/rede/api/ext/busca/cnae/9430800?limite=5000"
+curl "http://localhost/rede/api/ext/busca/cnae/9430800?limite=5000&proxima_pagina=01040736000156"
+# ... até "proxima_pagina": null (a última página traz os ids restantes)
+```
+
+O valor de `proxima_pagina` é o último CNPJ da página recebida (a busca
+continua a partir do CNPJ seguinte), mas quem chama não precisa saber disso:
+basta reenviá-lo. Um valor que não seja um CNPJ de 14 dígitos retorna `400`.
+
+Cada página é uma consulta curta (segura o `gLock` por pouco tempo, sem
+travar a interface web), em vez de uma única consulta enorme.
+
+Para restringir a um Estado, acrescente `uf` (sigla, maiúscula ou minúscula;
+`EX` = endereço no exterior) — a paginação funciona igual, mantendo o mesmo
+`uf` em todas as páginas:
+
+```bash
+curl "http://localhost/rede/api/ext/busca/cnae/9430800?uf=RS&limite=5000"
+curl "http://localhost/rede/api/ext/busca/cnae/9430800?uf=RS&limite=5000&proxima_pagina=<valor recebido>"
+```
+
+`uf` fora da lista das 27 siglas + `EX` retorna `400`.
 
 ### Exemplos
 
@@ -120,7 +162,7 @@ para como criá-lo a partir de `rede/rede.ini.local.example`.
 
 ```ini
 [API]
-api_ext_busca=1          # habilita /busca/nome, /busca/cnpj_raiz, /busca/cpf
+api_ext_busca=1          # habilita /busca/nome, /busca/cnpj_raiz, /busca/cnae, /busca/cpf
 api_ext_dados=1           # habilita /dados
 api_ext_requer_chave=0    # 1 = exige api_key válida (ver abaixo) em todas as rotas /api/ext
 ```
@@ -180,18 +222,35 @@ consulta ao banco foi duplicada. O registro do blueprint acontece só em
 demais buscas, que usam a tabela virtual FTS5 `id_search` (pensada para busca
 textual livre por nome/descrição), CNAE fiscal é um código de igualdade
 exata, então a consulta é direta em `estabelecimento.cnae_fiscal`, usando o
-índice `idx_estabelecimento_cnae_fiscal` (criado junto com os demais índices
-de `estabelecimento` em `rede_cria_tabelas/dados_cnpj_para_sqlite.py`).
-Bases já geradas antes dessa mudança precisam rodar
-`CREATE INDEX idx_estabelecimento_cnae_fiscal ON estabelecimento (cnae_fiscal);`
-manualmente para não cair em table scan.
+índice composto `idx_estabelecimento_cnae_fiscal_cnpj_uf (cnae_fiscal, cnpj, uf)`
+(criado junto com os demais índices de `estabelecimento` em
+`rede_cria_tabelas/dados_cnpj_para_sqlite.py` e
+`dados_cnpj_para_sqlite_progresso.py`). O `cnpj` logo depois do CNAE é o que
+torna a paginação barata: cada página sai do índice já ordenada, sem ordenar
+todos os estabelecimentos do CNAE a cada chamada. O `uf` no fim permite que
+o mesmo índice atenda a busca com `uf`: o SQLite percorre o CNAE em ordem de
+CNPJ e descarta, dentro do próprio índice, as linhas de outros Estados. Com
+`uf` no meio (`cnae_fiscal, uf, cnpj`) seria preciso um segundo índice, sem
+`uf`, para a busca do Brasil inteiro não reordenar o CNAE a cada página
+(conferido no plano de execução do SQLite) — ~2 GB a mais em produção. O
+custo do `uf` no fim: na busca por Estado, cada página lê também as linhas
+dos outros Estados daquele CNAE (só no índice, leitura sequencial).
+A consulta usa `UNION` (e não
+`UNION ALL`) porque `estabelecimento` tem CNPJs repetidos — deduplicar antes
+do `LIMIT` garante `limite` CNPJs distintos por página.
+Bases já geradas antes dessa mudança precisam rodar manualmente, para não
+cair em table scan:
+
+```sql
+CREATE INDEX idx_estabelecimento_cnae_fiscal_cnpj_uf ON estabelecimento (cnae_fiscal, cnpj, uf);
+```
 
 **Zero à esquerda:** parte dos registros de `estabelecimento.cnae_fiscal` tem
 o zero à esquerda do código oficial suprimido (ex.: `151201` em vez de
 `0151201`) — afeta só as seções A e B da CNAE (agropecuária, pesca e
 indústrias extrativas, os únicos códigos que começam com `0`); a tabela
 `cnae` (referência oficial) sempre tem os 7 dígitos corretos. `busca_cnae`
-já busca as duas variantes (`cnae_fiscal in (:codigo, :codigo_sem_zero)`)
+já busca as duas variantes (um lado do `UNION` para `:codigo`, outro para `:codigo_sem_zero`)
 para não perder esses registros — confirmado batendo o código de 7 dígitos
 contra a tabela `cnae` para todos os 122 códigos de 6 dígitos existentes na
 base local de teste.

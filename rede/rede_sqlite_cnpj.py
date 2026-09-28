@@ -236,39 +236,53 @@ def busca_cnpj(cnpj_basico, limiteIn):
     return spj
 #.def busca_cnpj
 
-def busca_cnae(codigo, limiteIn):
-    '''busca ids de empresas cujo cnae_fiscal (principal) seja igual a codigo.
-    diferente de busca_cnpj/busca_cpf, não usa a FTS id_search (que indexa
-    id/descrição para texto livre) -- cnae_fiscal é um código de igualdade
-    exata, então a consulta é direta na tabela estabelecimento, usando o
-    índice idx_estabelecimento_cnae_fiscal.
+def busca_cnae(codigo, limiteIn, ultimo_cnpj='', uf=''):
+    '''busca os CNPJs cujo CNAE fiscal principal é `codigo` (7 dígitos), uma
+    página por vez, em ordem crescente de CNPJ.
 
-    codigo_sem_zero: parte da base tem cnae_fiscal gravado sem o zero à
-    esquerda (ex.: "151201" em vez de "0151201") -- confirmado contra a
-    tabela cnae (que sempre tem os 7 dígitos oficiais); afeta só os códigos
-    das seções A/B da CNAE, que começam com 0 (agropecuária, pesca e
-    indústrias extrativas). Sem essa segunda variante no IN, buscar por
-    qualquer CNAE desses setores usando o código oficial de 7 dígitos não
-    encontraria nada.'''
-    kLimiteCnae = 200
+    parâmetros (ultimo_cnpj e uf chegam já validados pela rota):
+      limiteIn    -- tamanho da página (padrão 10, máximo kLimiteCnae)
+      ultimo_cnpj -- último CNPJ da página anterior; '' = 1ª página
+      uf          -- sigla do Estado; '' = Brasil inteiro
 
-    limite = min(limiteIn, kLimiteCnae) if limiteIn else 10
+    retorna (ids, tem_mais):
+      ids      -- lista de 'PJ_<cnpj>', sem repetição
+      tem_mais -- True se há outra página: pedi-la com ultimo_cnpj = último de ids
+
+    CNAE é um código exato, então consulta direto a tabela estabelecimento
+    (sem a busca textual id_search usada por busca_cnpj/busca_cpf).'''
+    kLimiteCnae = 5000
+
+    # limite <= 0 vira 10: no SQLite, LIMIT negativo significa "sem limite"
+    limite = min(limiteIn, kLimiteCnae) if limiteIn and limiteIn > 0 else 10
+    # parte da base grava o CNAE sem o zero à esquerda ("151201" em vez de
+    # "0151201"; só códigos iniciados em 0) -- por isso busca as duas formas
     codigo_sem_zero = codigo.lstrip('0') or '0'
 
+    # índice idx_estabelecimento_cnae_fiscal_cnpj_uf (cnae_fiscal, cnpj, uf):
+    # as linhas já saem em ordem de CNPJ, e "cnpj > :ultimo_cnpj" pula direto
+    # para onde a página anterior parou -- nada é reordenado a cada chamada.
+    # Com uf no fim, o mesmo índice filtra por Estado sem ler a tabela.
+    # UNION (e não UNION ALL) remove os CNPJs repetidos da tabela antes do
+    # LIMIT, para cada página ter `limite` CNPJs distintos.
     query = '''
-            SELECT cnpj
-            FROM estabelecimento
-            where cnae_fiscal in (:codigo, :codigo_sem_zero)
+            SELECT cnpj FROM estabelecimento
+            where cnae_fiscal = :codigo and (:uf = '' or uf = :uf) and cnpj > :ultimo_cnpj
+            UNION
+            SELECT cnpj FROM estabelecimento
+            where cnae_fiscal = :codigo_sem_zero and (:uf = '' or uf = :uf) and cnpj > :ultimo_cnpj
+            order by cnpj
             limit :limite '''
     with contextlib.closing(sqlite3.connect(caminhoDBReceita, uri=True)) as con: #sintaxe para autoclose
         con.row_factory=sqlite3.Row
         cur = con.cursor()
-        cur.execute(query, {'codigo':codigo,'codigo_sem_zero':codigo_sem_zero,'limite':limite})
-        scnae = {'PJ_'+k['cnpj'] for k in cur}
+        # limite+1: se a linha extra vier, há outra página (ela não é devolvida)
+        cur.execute(query, {'codigo':codigo,'codigo_sem_zero':codigo_sem_zero,'uf':uf,'ultimo_cnpj':ultimo_cnpj,'limite':limite+1})
+        lcnae = ['PJ_'+k['cnpj'] for k in cur]
         cur.close()
     cur = None
     con = None
-    return scnae
+    return lcnae[:limite], len(lcnae) > limite
 #.def busca_cnae
 
 def busca_cpf(cpfin, limiteIn):
