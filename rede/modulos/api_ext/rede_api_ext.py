@@ -9,6 +9,14 @@ nenhuma alteração nos arquivos originais do projeto.
 from flask import Blueprint, request, abort, Response
 from orjson import dumps as jsonify
 
+# siglas aceitas no parâmetro uf de /busca/cnae: os valores que aparecem em
+# estabelecimento.uf na base da Receita (27 UFs + EX = endereço no exterior)
+UFS_VALIDAS = {
+    'AC', 'AL', 'AM', 'AP', 'BA', 'CE', 'DF', 'ES', 'GO', 'MA', 'MG', 'MS',
+    'MT', 'PA', 'PB', 'PE', 'PI', 'PR', 'RJ', 'RN', 'RO', 'RR', 'RS', 'SC',
+    'SE', 'SP', 'TO', 'EX',
+}
+
 
 def criar_blueprint(rede_mod):
     """rede_mod = o módulo rede.py já carregado e inicializado (via wsgi.py),
@@ -72,6 +80,31 @@ def criar_blueprint(rede_mod):
             limite = request.args.get('limite', 10, type=int)
             ids = _com_lock(rede_relacionamentos.busca_cnpj, cnpj_basico, limite)
             return _resposta_json({'ids': sorted(ids)})
+
+        @bp.route('/busca/cnae/<codigo>', methods=['GET'])
+        @limiter.limit(limiter_dados)
+        def busca_cnae_codigo(codigo):
+            if cfg['API'].getboolean('api_ext_requer_chave', False):
+                _checa_chave()
+            if not (codigo.isdigit() and len(codigo) == 7):
+                return abort(400, description='codigo deve ter 7 dígitos')
+            # proxima_pagina: valor recebido no campo de mesmo nome da resposta
+            # anterior (é o último CNPJ daquela página); ausente = 1ª página
+            proxima_pagina = request.args.get('proxima_pagina', '')
+            if proxima_pagina and not (proxima_pagina.isdigit() and len(proxima_pagina) == 14):
+                return abort(400, description='proxima_pagina inválida: use o valor recebido na resposta anterior')
+            uf = request.args.get('uf', '').strip().upper()
+            if uf and uf not in UFS_VALIDAS:
+                return abort(400, description='uf deve ser a sigla de um Estado (ex.: RS) ou EX')
+            limite = request.args.get('limite', 10, type=int)
+            ids, tem_mais = _com_lock(rede_relacionamentos.busca_cnae, codigo, limite, proxima_pagina, uf)
+            # sem sorted(): busca_cnae já devolve em ordem de CNPJ, e essa
+            # ordem é o que faz a paginação funcionar.
+            # proxima_pagina = valor a reenviar, no parâmetro de mesmo nome,
+            # para pegar a página seguinte; None quando não há mais nada (já
+            # na 1ª resposta, se tudo coube numa página).
+            proxima = ids[-1][3:] if tem_mais else None
+            return _resposta_json({'ids': ids, 'proxima_pagina': proxima})
 
         @bp.route('/busca/cpf/<cpf_parcial>', methods=['GET'])
         @limiter.limit(limiter_dados)
