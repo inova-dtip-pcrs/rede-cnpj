@@ -94,6 +94,16 @@
 #   (os valores que variam por ambiente vão em rede.ini.local), então não é
 #   esperado que apareça aqui.
 #
+# Arquivos skip-worktree alterados no repositório (rede/bases/*.db):
+#   Se um commit novo altera um arquivo que em produção está marcado com
+#   skip-worktree (ex.: alguém commitou a base cnpj.db de exemplo), o `git
+#   pull` normal abortaria para não sobrescrever a base real. O script
+#   detecta isso, tira a base real do caminho (mv para
+#   "<arquivo>.preserva_deploy"), faz o pull e devolve a base real no lugar,
+#   remarcando skip-worktree. A base de produção nunca é substituída pela
+#   versão do repositório. O mesmo vale para o `git reset --hard` do
+#   rollback. Ver preserva_skip_worktree/restaura_skip_worktree.
+#
 # Qualquer falha em qualquer etapa (conectividade de rede, autenticação,
 # verificação de versão, atualização de código, build/troca do container)
 # interrompe o script imediatamente (exit 1).
@@ -195,6 +205,66 @@ except urllib.error.HTTPError:
         sleep 2
     done
     return 1
+}
+
+# Arquivos marcados com `git update-index --skip-worktree` (rede/bases/*.db
+# em produção: a base real, que difere da versão de exemplo versionada)
+# travam qualquer operação que precise trocar o conteúdo deles -- `git pull`
+# aborta com "Your local changes ... would be overwritten by merge" e `git
+# reset --hard <outro commit>` com "Entry ... not uptodate". Isso acontece
+# sempre que um commit altera o .db versionado (ex.: PR que commitou a base
+# de exemplo por engano).
+#
+# preserva_skip_worktree <commit_destino>: para cada arquivo skip-worktree
+# que muda entre HEAD e <commit_destino>, move a cópia local (a base real)
+# para "<arquivo>.preserva_deploy", tira a marcação e restaura a versão
+# versionada, deixando o git livre para atualizá-la. A lista fica em
+# ARQS_PRESERVADOS. restaura_skip_worktree desfaz isso (devolve a base real
+# e remarca skip-worktree) e deve rodar SEMPRE depois, com sucesso ou falha
+# da operação git -- por isso também fica registrada num trap de EXIT.
+# Mover é instantâneo (mesmo filesystem) e o container que está com a base
+# aberta continua lendo o mesmo inode; só conexões novas abertas nesse
+# intervalo de segundos podem falhar.
+ARQS_PRESERVADOS=()
+
+preserva_skip_worktree() {
+    local destino="$1"
+    local arq
+    ARQS_PRESERVADOS=()
+    while IFS= read -r -d '' arq; do
+        [[ -e "$arq" ]] || continue
+        if [[ -e "$arq.preserva_deploy" ]]; then
+            echo "Erro: $arq.preserva_deploy já existe (sobra de uma execução interrompida?)."
+            echo "Verifique qual é a base correta e remova/renomeie esse arquivo antes de continuar."
+            restaura_skip_worktree
+            exit 1
+        fi
+        echo "Preservando $arq (skip-worktree, alterado no commit de destino)..."
+        mv -- "$arq" "$arq.preserva_deploy" || { echo "Erro: falha ao mover $arq."; restaura_skip_worktree; exit 1; }
+        ARQS_PRESERVADOS+=("$arq")
+        git update-index --no-skip-worktree -- "$arq"
+        git checkout -- "$arq"
+    done < <(comm -z -12 \
+        <(git ls-files -v -z | sed -z -n 's/^[Ss] //p' | sort -z) \
+        <(git diff -z --name-only HEAD "$destino" -- | sort -z))
+    if [[ ${#ARQS_PRESERVADOS[@]} -gt 0 ]]; then
+        trap restaura_skip_worktree EXIT
+    fi
+}
+
+restaura_skip_worktree() {
+    local arq
+    for arq in "${ARQS_PRESERVADOS[@]}"; do
+        echo "Restaurando $arq local (skip-worktree)..."
+        mv -f -- "$arq.preserva_deploy" "$arq"
+        # Se o commit de destino removeu o arquivo do repositório, ele agora
+        # é só um arquivo não versionado -- não há o que remarcar.
+        if git ls-files --error-unmatch -- "$arq" >/dev/null 2>&1; then
+            git update-index --skip-worktree -- "$arq"
+        fi
+    done
+    ARQS_PRESERVADOS=()
+    trap - EXIT
 }
 
 
@@ -325,9 +395,13 @@ if ! git diff --quiet HEAD --; then
     fi
 fi
 
+preserva_skip_worktree origin/master
+
 echo 'Realizando atualização do rede-cnpj...'
 git pull
-if [[ $? -ne 0 ]]; then
+RC_PULL=$?
+restaura_skip_worktree
+if [[ $RC_PULL -ne 0 ]]; then
     echo "Erro: git pull falhou. O script será interrompido."
     exit 1
 fi
@@ -402,7 +476,10 @@ if ! health_gate; then
             # tentar de novo, apesar de produção ter voltado para a versão
             # anterior.
             echo "Revertendo o workspace para ${LOCAL_HASH:0:7}, para ficar de acordo com a imagem em produção..."
-            git -C "$APP_DIR" reset --hard "$LOCAL_HASH"
+            cd "$APP_DIR" || exit 1
+            preserva_skip_worktree "$LOCAL_HASH"
+            git reset --hard "$LOCAL_HASH"
+            restaura_skip_worktree
         else
             echo "!! Rollback também não respondeu. Investigue manualmente:"
             echo "   $DOCKER_COMPOSE_BIN logs app | tail -n 80"
