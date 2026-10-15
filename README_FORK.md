@@ -61,6 +61,7 @@ O prefixo de rota segue o `subdomain` configurado em `rede.ini`
 | `GET /rede/api/ext/busca/cnae/<codigo>` | Busca ids de empresas pelo CNAE fiscal principal (7 dígitos), paginado — ver [Paginação da busca por CNAE](#paginação-da-busca-por-cnae) | `limite` (padrão 10, máx. 5000), `uf` (sigla do Estado ou `EX`, opcional), `proxima_pagina` (valor recebido na resposta anterior, opcional) |
 | `GET /rede/api/ext/busca/cpf/<cpf_parcial>` | Busca ids de sócios PF pelo miolo do CPF (mín. 9 dígitos) | `limite` (padrão 10, máx. 100) |
 | `GET /rede/api/ext/dados` | Retorna dados completos de uma lista de ids (CNPJ/CPF) | `ids` (obrigatório, separados por vírgula, ex. `PJ_12345678000199,PJ_...`), `socios` (`1` para incluir sócios) |
+| `GET /rede/api/ext/referencia` | Data de referência da base da Receita em uso — ver [Data de referência da base](#data-de-referência-da-base) | — |
 
 As rotas de busca (`/busca/...`) retornam apenas os ids encontrados
 (`{"ids": [...]}`) — use `/dados?ids=...` em seguida para obter os dados
@@ -141,6 +142,23 @@ curl "http://localhost/rede/api/ext/busca/cnae/9430800?uf=RS&limite=5000&proxima
 
 `uf` fora da lista das 27 siglas + `EX` retorna `400`.
 
+### Data de referência da base
+
+`/referencia` devolve a data da base da Receita carregada no `cnpj.db`
+(tabela `_referencia`, linha `CNPJ`) e a quantidade de estabelecimentos:
+
+```json
+{"data_referencia": "12/09/2026", "cnpj_qtde": 66000000}
+```
+
+`data_referencia` vem como gravada pela carga (`dd/mm/aaaa`, ou o
+`xx/xx/aaaa` padrão se o nome do `.EMPRECSV` não seguir o formato
+esperado) — compare a string inteira em vez de interpretá-la como data.
+Serve para consumidores (ex.: Argos) recarregarem suas cópias só quando a
+base mudar. O valor é lido uma vez por processo (`referenciaF`, com
+`lru_cache`) e se renova no restart que `atualiza_base.py` faz após trocar a
+base. Habilitada junto com `/dados` (`api_ext_dados=1`).
+
 ### Exemplos
 
 ```bash
@@ -163,7 +181,7 @@ para como criá-lo a partir de `rede/rede.ini.local.example`.
 ```ini
 [API]
 api_ext_busca=1          # habilita /busca/nome, /busca/cnpj_raiz, /busca/cnae, /busca/cpf
-api_ext_dados=1           # habilita /dados
+api_ext_dados=1           # habilita /dados e /referencia
 api_ext_requer_chave=0    # 1 = exige api_key válida (ver abaixo) em todas as rotas /api/ext
 ```
 

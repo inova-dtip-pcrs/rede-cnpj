@@ -132,4 +132,19 @@ def criar_blueprint(rede_mod):
             dados = _com_lock(rede_relacionamentos.jsonDados, lista_ids, bsocios)
             return _resposta_json(dados)
 
+        @bp.route('/referencia', methods=['GET'])
+        @limiter.limit(limiter_dados)
+        def referencia():
+            # data da base da Receita em uso (tabela _referencia do cnpj.db,
+            # 'dd/mm/aaaa'). Consumidores comparam com o valor da última carga
+            # para saber se a base mudou. referenciaF tem lru_cache, renovado
+            # pelo restart do container que atualiza_base.py faz após a troca.
+            if cfg['API'].getboolean('api_ext_requer_chave', False):
+                _checa_chave()
+            ref = _com_lock(rede_relacionamentos.referenciaF)
+            return _resposta_json({
+                'data_referencia': ref['data_referencia'],
+                'cnpj_qtde': ref['cnpj_qtde'],
+            })
+
     return bp
