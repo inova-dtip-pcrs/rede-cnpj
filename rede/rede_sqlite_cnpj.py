@@ -285,6 +285,38 @@ def busca_cnae(codigo, limiteIn, ultimo_cnpj='', uf=''):
     return lcnae[:limite], len(lcnae) > limite
 #.def busca_cnae
 
+def cnae_secundario_indexado(codigo):
+    '''True se `codigo` está em cnae_secundario_indexados, ou seja, se
+    busca_cnae_secundario cobre esse CNAE. Levanta sqlite3.OperationalError se a
+    base é anterior à tabela (criada por rede_cria_tabelas/cnae_secundario.py).'''
+    with contextlib.closing(sqlite3.connect(caminhoDBReceita, uri=True)) as con:
+        return con.execute('SELECT 1 FROM cnae_secundario_indexados WHERE cnae = ?', (codigo,)).fetchone() is not None
+#.def cnae_secundario_indexado
+
+def busca_cnae_secundario(codigo, limiteIn, ultimo_cnpj='', uf=''):
+    '''como busca_cnae, mas para os CNPJs que têm `codigo` entre os CNAEs
+    secundários (o principal pode ser outro). Mesmos parâmetros e retorno
+    (ids, tem_mais), mesma paginação por CNPJ.
+
+    Lê a tabela estabelecimento_cnae_secundario (rede_cria_tabelas/cnae_secundario.py),
+    que só tem os CNAEs de cnae_secundario_indexados: confira com
+    cnae_secundario_indexado antes, senão "nenhuma empresa" e "CNAE não indexado"
+    ficam indistinguíveis. A PK (cnae, cnpj, uf) serve de índice; o código já está
+    com 7 dígitos lá, então não precisa da variante sem zero de busca_cnae.'''
+    kLimiteCnae = 5000
+    limite = min(limiteIn, kLimiteCnae) if limiteIn and limiteIn > 0 else 10
+    query = '''
+            SELECT cnpj FROM estabelecimento_cnae_secundario
+            where cnae = :codigo and (:uf = '' or uf = :uf) and cnpj > :ultimo_cnpj
+            order by cnpj
+            limit :limite '''
+    with contextlib.closing(sqlite3.connect(caminhoDBReceita, uri=True)) as con:
+        cur = con.execute(query, {'codigo':codigo,'uf':uf,'ultimo_cnpj':ultimo_cnpj,'limite':limite+1})
+        lcnae = ['PJ_'+k[0] for k in cur]
+        cur.close()
+    return lcnae[:limite], len(lcnae) > limite
+#.def busca_cnae_secundario
+
 def busca_cpf(cpfin, limiteIn):
     '''como a base não tem cpfs de sócios completos, faz busca só do miolo. retorna PF_xxx-nome'''
     #print('busca_cpf')

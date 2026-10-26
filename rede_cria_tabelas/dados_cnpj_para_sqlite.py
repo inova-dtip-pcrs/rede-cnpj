@@ -19,6 +19,7 @@ A utilização da biblioteca DASK tem desempenho melhor do que o uso de PANDAS (
 import pandas as pd, sqlite3, sqlalchemy
 import glob, time, dask.dataframe as dd
 import os, sys, zipfile, gc
+import cnae_secundario
 
 dataReferencia = "xx/xx/2026"  # input('Data de referência da base dd/mm/aaaa: ')
 pasta_compactados = r"dados-publicos-zip"  # local dos arquivos zipados da Receita
@@ -304,6 +305,9 @@ where ts.identificador_de_socio='1';
 '''
 
 sqls += sqlSociosApartir202608 if anoMes>='202608' else sqlsSociosAte202607
+
+# índice de CNAE secundário (rota /busca/cnae_secundario), só dos CNAEs de cnae_secundario.py
+sqls += ";\n".join(cnae_secundario.sqls_indexacao()) + ";\n"
 
 sqls += '''  
 ALTER TABLE empresas DROP COLUMN capital_social_str;

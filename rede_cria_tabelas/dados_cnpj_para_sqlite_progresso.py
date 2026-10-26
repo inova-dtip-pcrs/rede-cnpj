@@ -11,6 +11,7 @@ Este script:
 
 import os, sys, glob, time, zipfile, sqlite3, hashlib, pandas as pd, sqlalchemy
 import dask.dataframe as dd
+import cnae_secundario
 
 pasta_compactados = r"dados-publicos-zip"
 pasta_saida = r"dados-publicos"
@@ -224,6 +225,9 @@ executa_sqls('indices_base', '''
     CREATE INDEX idx_socios_original_cnpj_basico
     ON socios_original(cnpj_basico);
 ''')
+
+# índice de CNAE secundário (rota /busca/cnae_secundario), só dos CNAEs de cnae_secundario.py
+executa_sqls('cnae_secundario', ";\n".join(cnae_secundario.sqls_indexacao()))
 
 executa_sqls('cnpj_base2matriz', '''
     create table cnpj_base2matriz as
