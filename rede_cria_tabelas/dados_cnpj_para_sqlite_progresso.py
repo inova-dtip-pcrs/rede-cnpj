@@ -11,6 +11,7 @@ Este script:
 
 import os, sys, glob, time, zipfile, sqlite3, hashlib, pandas as pd, sqlalchemy
 import dask.dataframe as dd
+import cnae_indices
 
 pasta_compactados = r"dados-publicos-zip"
 pasta_saida = r"dados-publicos"
@@ -219,11 +220,14 @@ executa_sqls('indices_base', '''
     CREATE  INDEX idx_estabelecimento_cnpj_basico ON estabelecimento (cnpj_basico);
     CREATE  INDEX idx_estabelecimento_cnpj ON estabelecimento (cnpj);
     CREATE  INDEX idx_estabelecimento_nomefantasia ON estabelecimento (nome_fantasia);
-    CREATE  INDEX idx_estabelecimento_cnae_fiscal_cnpj_uf ON estabelecimento (cnae_fiscal, cnpj, uf);
 
     CREATE INDEX idx_socios_original_cnpj_basico
     ON socios_original(cnpj_basico);
 ''')
+
+# índices de CNAE (/busca/cnae e /busca/cnae_secundario): ficam em cnae_indices.py
+# para não alterar dados_cnpj_para_sqlite.py, que é do projeto original
+executa_sqls('cnae', ";\n".join(cnae_indices.sqls_indexacao()))
 
 executa_sqls('cnpj_base2matriz', '''
     create table cnpj_base2matriz as

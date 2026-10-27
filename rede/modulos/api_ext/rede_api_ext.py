@@ -6,8 +6,12 @@ acesso a dados já existentes em rede_sqlite_cnpj.py.
 Registrado apenas em deploy/wsgi.py (não em rede/rede.py), para não exigir
 nenhuma alteração nos arquivos originais do projeto.
 """
+import sqlite3
+
 from flask import Blueprint, request, abort, Response
 from orjson import dumps as jsonify
+
+from modulos.api_ext import busca_cnae as busca
 
 # siglas aceitas no parâmetro uf de /busca/cnae: os valores que aparecem em
 # estabelecimento.uf na base da Receita (27 UFs + EX = endereço no exterior)
@@ -25,6 +29,9 @@ def criar_blueprint(rede_mod):
     rede_config.py contra o sys.argv real do gunicorn."""
 
     rede_relacionamentos = rede_mod.rede_relacionamentos
+    # base da Receita; as buscas por CNAE (busca_cnae.py) recebem o caminho, em vez
+    # de ficarem em rede_sqlite_cnpj.py (arquivo do projeto original)
+    caminho_db = rede_relacionamentos.caminhoDBReceita
     limiter = rede_mod.limiter
     gLock = rede_mod.gLock
     gUwsgiLock = rede_mod.gUwsgiLock
@@ -81,11 +88,9 @@ def criar_blueprint(rede_mod):
             ids = _com_lock(rede_relacionamentos.busca_cnpj, cnpj_basico, limite)
             return _resposta_json({'ids': sorted(ids)})
 
-        @bp.route('/busca/cnae/<codigo>', methods=['GET'])
-        @limiter.limit(limiter_dados)
-        def busca_cnae_codigo(codigo):
-            if cfg['API'].getboolean('api_ext_requer_chave', False):
-                _checa_chave()
+        def _busca_cnae_paginada(codigo, buscar):
+            '''Validação, paginação e resposta comuns a /busca/cnae e
+            /busca/cnae_secundario; `buscar` é a função de rede_relacionamentos.'''
             if not (codigo.isdigit() and len(codigo) == 7):
                 return abort(400, description='codigo deve ter 7 dígitos')
             # proxima_pagina: valor recebido no campo de mesmo nome da resposta
@@ -97,14 +102,38 @@ def criar_blueprint(rede_mod):
             if uf and uf not in UFS_VALIDAS:
                 return abort(400, description='uf deve ser a sigla de um Estado (ex.: RS) ou EX')
             limite = request.args.get('limite', 10, type=int)
-            ids, tem_mais = _com_lock(rede_relacionamentos.busca_cnae, codigo, limite, proxima_pagina, uf)
-            # sem sorted(): busca_cnae já devolve em ordem de CNPJ, e essa
+            ids, tem_mais = _com_lock(buscar, caminho_db, codigo, limite, proxima_pagina, uf)
+            # sem sorted(): a busca já devolve em ordem de CNPJ, e essa
             # ordem é o que faz a paginação funcionar.
             # proxima_pagina = valor a reenviar, no parâmetro de mesmo nome,
             # para pegar a página seguinte; None quando não há mais nada (já
             # na 1ª resposta, se tudo coube numa página).
             proxima = ids[-1][3:] if tem_mais else None
             return _resposta_json({'ids': ids, 'proxima_pagina': proxima})
+
+        @bp.route('/busca/cnae/<codigo>', methods=['GET'])
+        @limiter.limit(limiter_dados)
+        def busca_cnae_codigo(codigo):
+            if cfg['API'].getboolean('api_ext_requer_chave', False):
+                _checa_chave()
+            return _busca_cnae_paginada(codigo, busca.busca_cnae)
+
+        @bp.route('/busca/cnae_secundario/<codigo>', methods=['GET'])
+        @limiter.limit(limiter_dados)
+        def busca_cnae_secundario_codigo(codigo):
+            '''Como /busca/cnae, para quem tem o código entre os CNAEs secundários.
+            Só cobre os CNAEs de cnae_secundario_indexados (ver
+            rede_cria_tabelas/cnae_indices.py).'''
+            if cfg['API'].getboolean('api_ext_requer_chave', False):
+                _checa_chave()
+            if codigo.isdigit() and len(codigo) == 7:
+                try:
+                    indexado = _com_lock(busca.cnae_secundario_indexado, caminho_db, codigo)
+                except sqlite3.OperationalError:
+                    return abort(503, description='base sem o índice de CNAE secundário; rode rede_cria_tabelas/cnae_indices.py')
+                if not indexado:
+                    return abort(404, description='CNAE não indexado para busca secundária')
+            return _busca_cnae_paginada(codigo, busca.busca_cnae_secundario)
 
         @bp.route('/busca/cpf/<cpf_parcial>', methods=['GET'])
         @limiter.limit(limiter_dados)
