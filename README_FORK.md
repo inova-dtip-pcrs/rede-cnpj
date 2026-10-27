@@ -59,6 +59,7 @@ O prefixo de rota segue o `subdomain` configurado em `rede.ini`
 | `GET /rede/api/ext/busca/nome` | Busca ids por nome/razão social (full text) | `q` (obrigatório), `limite` (padrão 10, máx. 100) |
 | `GET /rede/api/ext/busca/cnpj_raiz/<cnpj_basico>` | Busca ids de filiais a partir da raiz do CNPJ (8 dígitos) | `limite` (padrão 10, máx. 200) |
 | `GET /rede/api/ext/busca/cnae/<codigo>` | Busca ids de empresas pelo CNAE fiscal principal (7 dígitos), paginado — ver [Paginação da busca por CNAE](#paginação-da-busca-por-cnae) | `limite` (padrão 10, máx. 5000), `uf` (sigla do Estado ou `EX`, opcional), `proxima_pagina` (valor recebido na resposta anterior, opcional) |
+| `GET /rede/api/ext/busca/cnae_secundario/<codigo>` | Como `/busca/cnae`, mas para quem tem o CNAE (7 dígitos) entre os **secundários**; só cobre os CNAEs indexados — ver [Busca por CNAE secundário](#busca-por-cnae-secundário) | mesmos de `/busca/cnae` |
 | `GET /rede/api/ext/busca/cpf/<cpf_parcial>` | Busca ids de sócios PF pelo miolo do CPF (mín. 9 dígitos) | `limite` (padrão 10, máx. 100) |
 | `GET /rede/api/ext/dados` | Retorna dados completos de uma lista de ids (CNPJ/CPF) | `ids` (obrigatório, separados por vírgula, ex. `PJ_12345678000199,PJ_...`), `socios` (`1` para incluir sócios) |
 | `GET /rede/api/ext/referencia` | Data de referência da base da Receita em uso — ver [Data de referência da base](#data-de-referência-da-base) | — |
@@ -92,7 +93,8 @@ ou como `0` (ou negativo, em `/busca/cnae`), cai no padrão de 10.
 |---|---|---|
 | `/busca/nome` | 100 | `rede_sqlite_cnpj.buscaPorNome` |
 | `/busca/cnpj_raiz/<cnpj_basico>` | 200 | `rede_sqlite_cnpj.busca_cnpj` |
-| `/busca/cnae/<codigo>` | 5000 por página | `rede_sqlite_cnpj.busca_cnae` |
+| `/busca/cnae/<codigo>` | 5000 por página | `modulos/api_ext/busca_cnae.busca_cnae` |
+| `/busca/cnae_secundario/<codigo>` | 5000 por página | `modulos/api_ext/busca_cnae.busca_cnae_secundario` |
 | `/busca/cpf/<cpf_parcial>` | 100 | `rede_sqlite_cnpj.busca_cpf` |
 | `/dados` | **sem limite** — processa todos os `ids` enviados | `rede_sqlite_cnpj.jsonDados` |
 
@@ -236,14 +238,17 @@ funções de acesso a dados já existentes em `rede/rede_sqlite_cnpj.py`
 consulta ao banco foi duplicada. O registro do blueprint acontece só em
 `deploy/wsgi.py`; `rede/rede.py` permanece inalterado.
 
-`busca_cnae` (usada por `/busca/cnae/<codigo>`) é a exceção: diferente das
+`busca_cnae` (usada por `/busca/cnae/<codigo>`) é a exceção: fica em
+`rede/modulos/api_ext/busca_cnae.py`, e não em `rede_sqlite_cnpj.py`, para não
+alterar arquivos do projeto original (recebe o caminho da base como
+parâmetro). Diferente das
 demais buscas, que usam a tabela virtual FTS5 `id_search` (pensada para busca
 textual livre por nome/descrição), CNAE fiscal é um código de igualdade
 exata, então a consulta é direta em `estabelecimento.cnae_fiscal`, usando o
 índice composto `idx_estabelecimento_cnae_fiscal_cnpj_uf (cnae_fiscal, cnpj, uf)`
-(criado junto com os demais índices de `estabelecimento` em
-`rede_cria_tabelas/dados_cnpj_para_sqlite.py` e
-`dados_cnpj_para_sqlite_progresso.py`). O `cnpj` logo depois do CNAE é o que
+(criado por `rede_cria_tabelas/cnae_indices.py`, chamado por
+`dados_cnpj_para_sqlite_progresso.py`; o script original
+`dados_cnpj_para_sqlite.py` não o cria). O `cnpj` logo depois do CNAE é o que
 torna a paginação barata: cada página sai do índice já ordenada, sem ordenar
 todos os estabelecimentos do CNAE a cada chamada. O `uf` no fim permite que
 o mesmo índice atenda a busca com `uf`: o SQLite percorre o CNAE em ordem de
@@ -256,11 +261,13 @@ dos outros Estados daquele CNAE (só no índice, leitura sequencial).
 A consulta usa `UNION` (e não
 `UNION ALL`) porque `estabelecimento` tem CNPJs repetidos — deduplicar antes
 do `LIMIT` garante `limite` CNPJs distintos por página.
-Bases já geradas antes dessa mudança precisam rodar manualmente, para não
-cair em table scan:
+Bases já geradas antes dessa mudança, ou geradas com o script original
+`dados_cnpj_para_sqlite.py`, precisam rodar uma vez, para não cair em table
+scan (cria o índice e as tabelas da busca por CNAE secundário, idempotente):
 
-```sql
-CREATE INDEX idx_estabelecimento_cnae_fiscal_cnpj_uf ON estabelecimento (cnae_fiscal, cnpj, uf);
+```bash
+cd rede_cria_tabelas
+python cnae_indices.py ../rede/bases/cnpj.db
 ```
 
 **Zero à esquerda:** parte dos registros de `estabelecimento.cnae_fiscal` tem
@@ -272,3 +279,39 @@ já busca as duas variantes (um lado do `UNION` para `:codigo`, outro para `:cod
 para não perder esses registros — confirmado batendo o código de 7 dígitos
 contra a tabela `cnae` para todos os 122 códigos de 6 dígitos existentes na
 base local de teste.
+
+
+### Busca por CNAE secundário
+
+`estabelecimento.cnae_fiscal_secundaria` é um texto `"4311801,5510801"`, que o
+SQLite não consegue indexar; um `LIKE` varreria a tabela inteira a cada página,
+segurando o lock global das rotas. Por isso `/busca/cnae_secundario/<codigo>`
+lê uma tabela derivada, `estabelecimento_cnae_secundario(cnae, cnpj, uf)`, com
+PK `(cnae, cnpj, uf)` `WITHOUT ROWID` (a própria PK é o índice, na mesma ordem do
+de `/busca/cnae`: paginação por `cnpj > :ultimo` e filtro de `uf` dentro do
+índice). Parâmetros, paginação (`proxima_pagina`) e formato da resposta são os
+de `/busca/cnae`; devolve **todas** as situações cadastrais, quem consome filtra.
+
+A tabela **não** tem todos os secundários da Receita (seriam centenas de milhões
+de linhas): só os CNAEs listados em `CNAES_SECUNDARIOS_INDEXADOS`, em
+`rede_cria_tabelas/cnae_indices.py` (hoje os 7 de hotelaria: 5510801,
+5510802, 5510803, 5590601, 5590602, 5590603 e 5590699). Um estabelecimento só
+tem linha para os códigos dessa lista que aparecem entre seus secundários. Os
+códigos indexados ficam em `cnae_secundario_indexados`; consultar outro
+código devolve **404** (não uma lista vazia, que pareceria "sem empresas"), e uma
+base sem as tabelas devolve **503**.
+
+Bases novas (geradas por `dados_cnpj_para_sqlite_progresso.py`) já nascem com
+a tabela. Para uma base já gerada, ou para acrescentar um CNAE (varre
+`estabelecimento` uma vez, sem recriar a base; repetir um código recarrega só
+ele):
+
+```bash
+cd rede_cria_tabelas
+python cnae_indices.py ../rede/bases/cnpj.db               # índice + os da lista
+python cnae_indices.py ../rede/bases/cnpj.db 5611201       # um CNAE a mais
+```
+
+O zero à esquerda omitido em parte da base (`151201` por `0151201`) é
+normalizado para 7 dígitos ao montar a tabela, então a consulta não precisa da
+variante sem zero que `busca_cnae` usa.
